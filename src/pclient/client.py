@@ -615,8 +615,8 @@ class ParallelClient:
                 f"[{self._pid}] Read {len(data)} bytes from {inp!s}"
             )
             bw = outp_f.write(data)
-            if bw < len(data):
-                raise ValueError(f"Short write: {bw}/{len(data)} to {outp!s}")
+            if bw != len(data):
+                raise ValueError(f"Bad write: {bw}/{len(data)} to {outp!s}")
         self._end_stamp(event)
 
 
