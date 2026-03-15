@@ -128,7 +128,8 @@ class ParallelClient:
         self._me = Path(__file__).resolve()
 
         self._logger.debug(
-            f"__init()__ values for {self._me!s} process {self._pid}:"
+            f"[{self._pid}]"
+            f" __init()__ values for {self._me!s}:"
             f" URL: {self._url!s}"
             f" output: {self._output!s}"
             f" working dir: {self._working_dir!s}"
@@ -162,13 +163,14 @@ class ParallelClient:
         with tempfile.TemporaryDirectory(dir=work_dir) as wd:
             cwd = Path(wd)
             os.chdir(cwd)
+            self._logger.debug(f"[{self._pid}] Working directory is now {wd}")
             if self._byte_range:
                 raise ValueError(
                     "_master_fetch can only be called from parent process"
                 )
             # Truncate output file
             with output.open("wb") as f:
-                pass
+                f.truncate()
             self._lock.acquire()
             self._ordinal = 1  # Reset event counter
             self._timings = []  # and timings
@@ -178,8 +180,8 @@ class ParallelClient:
             await self._get_filesize()
             if self._filesize is None:
                 self._logger.warning(
-                    f"{url} does not support byte ranges; single-threaded"
-                    f" output in {output}"
+                    f"[{self._pid}] {url} does not support byte ranges;"
+                    f" single-threaded output in {output}"
                 )
             else:
                 await self._parallel_fetch()
@@ -238,7 +240,9 @@ class ParallelClient:
             ev2 = f"Get range for {url}"
             self._start_stamp(ev2)
             headers = {"Range": "bytes=0-0"}
-            self._logger.debug(f"About to fetch {url} for filesize")
+            self._logger.debug(
+                f"[{self._pid}] About to fetch {url} for filesize"
+            )
             r = await c.get(url, headers=headers)
             self._end_stamp(ev2)
             r.raise_for_status()
@@ -266,28 +270,29 @@ class ParallelClient:
             self._end_stamp(event)
             if self._filesize and self._filesize != filesize:
                 self._logger.warning(
-                    f"Stored filesize {self._filesize} != {filesize}"
+                    f"[{self._pid}] Stored filesize {self._filesize}"
+                    f" != {filesize}"
                 )
             self._filesize = filesize
+            self._logger.debug(f"[{self._pid}] Stored filesize {filesize}")
 
     async def _chunk_range(self, inp: _ByteRange) -> None:
         event = f"Chunking range {inp}"
         self._start_stamp(event)
-        size = inp.last - inp.first
-        offset = 0
+        offset = inp.first
         chunks: collections.deque[_ByteRange] = collections.deque()
-        while offset <= size:
-            if offset + self._chunk_size < size:
+        while offset <= inp.last:
+            if offset + self._chunk_size < inp.last:
                 end = offset + self._chunk_size - 1
             else:
-                end = size
+                end = inp.last
             chunk = _ByteRange(first=offset, last=end)
             offset = offset + self._chunk_size
             chunks.append(chunk)
         self._lock.acquire()
         self._chunks = chunks
         self._lock.release()
-        self._logger.debug(f"Chunks: {self._chunks}")
+        self._logger.debug(f"[{self._pid}] Chunks: {self._chunks}")
         self._end_stamp(event)
 
     async def _write_file(self, output: Path, r: httpx.Response) -> None:
@@ -301,19 +306,20 @@ class ParallelClient:
             self._end_stamp(event)
             return
         with output.open("wb") as f:
-            written = 0
             async for data in r.aiter_bytes():
-                while written < len(data):
-                    written += f.write(data[written:])
+                self._logger.debug(
+                    f"[{self._pid}] writing {len(data)} bytes to {output!s}"
+                )
+                f.write(data)
         self._end_stamp(event)
 
     def _start_stamp(self, event: str) -> None:
-        self._logger.debug(f"Start {event}")
+        self._logger.debug(f"[{self._pid}] Start {event}")
         self._stamp(event=event, start=True)
 
     def _end_stamp(self, event: str) -> None:
         self._stamp(event=event, start=False)
-        self._logger.debug(f"Stop {event}")
+        self._logger.debug(f"[{self._pid}] Stop {event}")
 
     def _stamp(self, event: str, *, start: bool) -> None:
         now = datetime.datetime.now(tz=datetime.UTC)
@@ -373,13 +379,16 @@ class ParallelClient:
             del e_d[ev_id]
         if e_d:
             self._logger.warning(
-                f"Found start but no finish for {list(e_d.keys())}"
+                f"[{self._pid}] Found start but no finish"
+                f" for {list(e_d.keys())}"
             )
 
     async def _divide_subprocs(self, byte_range: _ByteRange) -> None:
-        size = byte_range.last - byte_range.first
+        size = byte_range.last - byte_range.first + 1
         if self._max_procs < 2:
-            self._logger.warning("Cannot subdivide process any further.")
+            self._logger.warning(
+                f"[{self._pid}] Cannot subdivide process any further."
+            )
             return
         chunks_per_process = int(size / (self._max_procs * self._chunk_size))
         leftover_chunks = int(
@@ -432,7 +441,9 @@ class ParallelClient:
             if self._debug:
                 args.append("--debug")
 
-            self._logger.debug(f"Spawn subprocess: {self._me!s} {args}")
+            self._logger.debug(
+                f"[{self._pid}] Spawn subprocess: {self._me!s} {args}"
+            )
             proc = await asyncio.subprocess.create_subprocess_exec(
                 str(self._me), *args
             )
@@ -441,7 +452,8 @@ class ParallelClient:
             await proc.wait()
             if proc.returncode != 0:
                 self._logger.error(
-                    f"Process {proc} exited with rc {proc.returncode}"
+                    f"[{self._pid}] Process {proc} exited with"
+                    f" rc {proc.returncode}"
                 )
 
     async def _fetch_singleproc_parts(self, byte_range: _ByteRange) -> None:
@@ -457,48 +469,63 @@ class ParallelClient:
         self._start_stamp(event)
         await self._chunk_range(byte_range)
         while True:
-            self._logger.debug("Acquiring lock to get chunk")
+            self._logger.debug(f"[{self._pid}] Acquiring lock to get chunk")
             self._lock.acquire()
             if len(self._chunks) < 1 and len(tasks) < 1:
                 # We have handled each chunk and all our tasks are done.
-                self._logger.debug("Chunks and tasks finished; releasing lock")
+                self._logger.debug(
+                    f"[{self._pid}] Chunks and tasks finished; releasing lock"
+                )
                 self._lock.release()
                 break
             tl = len(tasks)
-            self._logger.debug(f"{tl} task[s] exist[s]")
+            self._logger.debug(f"[{self._pid}] {tl} task[s] exist[s]")
             while tl < self._max_threads:
                 if len(self._chunks) > 0:
                     chunk = self._chunks.popleft()
-                    self._logger.debug(f"Got chunk {chunk} to work on")
+                    self._logger.debug(
+                        f"[{self._pid}] Got chunk {chunk} to work on"
+                    )
                     tasks.add(
                         asyncio.create_task(
                             self._fetch_range(chunk, base_file)
                         )
                     )
-                    self._logger.debug(f"Added task for {chunk}, {base_file}")
+                    self._logger.debug(
+                        f"[{self._pid}] Added task for {chunk}, {base_file}"
+                    )
                     tl += 1
                 else:
                     # If we run out of chunks, we can't refill the thread
                     # count.
-                    self._logger.debug("Chunks exhausted")
+                    self._logger.debug(f"[{self._pid}] Chunks exhausted")
                     break
             # Check each task for completion
             remove = set()
             for task in tasks:
-                self._logger.debug(f"Checking task {task} for completion")
+                self._logger.debug(
+                    f"[{self._pid}] Checking task {task} for completion"
+                )
                 if task.done():
-                    self._logger.debug(f"Task {task} complete")
+                    self._logger.debug(f"[{self._pid}] Task {task} complete")
                     remove.add(task)  # Don't alter the set while iterating it.
             for task in remove:
-                self._logger.debug(f"Removing completed task {task}")
+                self._logger.debug(
+                    f"[{self._pid}] Removing completed task {task}"
+                )
                 tasks.remove(task)
-            self._logger.debug(f"{len(tasks)} remain[s]; releasing lock.")
+            self._logger.debug(
+                f"[{self._pid}] {len(tasks)} task[s] remain[s];"
+                " releasing lock."
+            )
             self._lock.release()
             if len(tasks) == self._max_threads:
-                self._logger.debug("All task slots are full; waiting.")
+                self._logger.debug(
+                    f"[{self._pid}] All task slots are full; waiting."
+                )
             # Pause a bit.
             await asyncio.sleep(0.1)
-        self._logger.debug("Left chunk task loop.")
+        self._logger.debug(f"[{self._pid}] Left chunk task loop.")
         self._end_stamp(event)
         if self._report:
             await self._generate_report()
@@ -517,6 +544,8 @@ class ParallelClient:
         directory where we want to write this file.
         """
         url = self._url
+        if self._filesize is None:
+            self._logger.debug(f"[{self._pid}] filesize is unknown; using 1e9")
         filesize = self._filesize or 1e9
         digits = len(str(filesize))
         n_format = f"{{:0{digits}d}}"
@@ -543,6 +572,7 @@ class ParallelClient:
         event = f"Reassemble {base_name}"
         self._start_stamp(event)
         parts = Path().glob(f"{base_name}.*.part")
+        self._logger.debug(f"[{self._pid}] file parts: {parts}")
         async with asyncio.TaskGroup() as tg:
             tasks: set[asyncio.Task] = set()
             for partfile in parts:
@@ -561,12 +591,13 @@ class ParallelClient:
         if len(parts) < 3 or parts[-1] != "part":
             raise ValueError(f"{fname} doesn't look like a part file")
         first, last = map(int, parts[-2].split("-"))
-        size = last - first
-        read_size = size + 1
+        size = last - first + 1
         if size > self._chunk_size:
-            self._logger.warning(f"Chunk size {size} > {self._chunk_size}")
-            read_size = self._chunk_size
-        self._copy_file_part(inp, outp, read_size, offset=first)
+            self._logger.warning(
+                f"[{self._pid}] Chunk size {size} > {self._chunk_size}"
+            )
+            size = self._chunk_size
+        self._copy_file_part(inp, outp, size, offset=first)
         self._end_stamp(event)
 
     def _copy_file_part(
@@ -574,30 +605,18 @@ class ParallelClient:
     ) -> None:
         """Copy a part file into the target file at a specific offset."""
         # Old-school!  Feels like I'm doing file I/O in C!
-        event = f"copy file part at {offset}; {read_size} bytes"
+        event = (f"copy file part {inp!s} ({read_size} bytes) to"
+                 f" {outp!s} at {offset})")
         self._start_stamp(event)
         with outp.open("ab") as outp_f:
             outp_f.seek(offset)
-            with inp.open("rb") as inp_f:
-                while True:
-                    data = inp_f.read(read_size)
-                    self._logger.debug(f"Read {len(data)} bytes from {inp!s}")
-                    if not data:
-                        self._logger.debug("Out of data; leaving")
-                        break
-                    while data:
-                        written = outp_f.write(data)
-                        self._logger.debug(
-                            f"Wrote {written} bytes to {outp!s} at {offset}"
-                        )
-                        if written < len(data):
-                            self._logger.warning(
-                                f"Short write to {outp!s}:"
-                                f" {written}/{len(data)}"
-                            )
-                            data = data[written:]
-                        else:
-                            break
+            data = inp.read_bytes()
+            self._logger.debug(
+                f"[{self._pid}] Read {len(data)} bytes from {inp!s}"
+            )
+            bw = outp.write_bytes(data)
+            if bw < len(data):
+                raise ValueError(f"Short write: {bw}/{len(data)} to {outp!s}")
         self._end_stamp(event)
 
 
@@ -700,6 +719,7 @@ def main() -> None:
         report=args.report,
         debug=args.debug,
         byte_range=args.byte_range,
+        filesize=args.filesize,
     )
 
 
