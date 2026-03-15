@@ -614,7 +614,7 @@ class ParallelClient:
             self._logger.debug(
                 f"[{self._pid}] Read {len(data)} bytes from {inp!s}"
             )
-            bw = outp.write_bytes(data)
+            bw = outp_f.write(data)
             if bw < len(data):
                 raise ValueError(f"Short write: {bw}/{len(data)} to {outp!s}")
         self._end_stamp(event)
