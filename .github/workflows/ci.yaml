@@ -1,0 +1,155 @@
+name: CI
+
+env:
+  # Current supported uv version. The uv documentation recommends pinning
+  # this. The version should match the version used in .pre-commit-config.yaml
+  # and frozen in uv.lock. It is updated by make update-deps.
+  UV_VERSION: "0.10.10"
+
+"on":
+  merge_group: {}
+  pull_request: {}
+  push:
+    branches-ignore:
+      # These should always correspond to pull requests, so ignore them for
+      # the push trigger and let them be triggered by the pull_request
+      # trigger, avoiding running the workflow twice. This is a minor
+      # optimization so there's no need to ensure this is comprehensive.
+      - "dependabot/**"
+      - "gh-readonly-queue/**"
+      - "renovate/**"
+      - "t/**"
+      - "tickets/**"
+      - "u/**"
+  release:
+    types: [published]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Run tox
+        run: uv run --only-group=tox tox run -e lint,typing,py,coverage-report
+
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      pull-requests: read
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+      docs-specific: ${{ steps.filter.outputs.docs-specific }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            docs:
+              - "docs/**"
+              - "src/pclient/**"
+            docs-specific:
+              - "docs/**"
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    needs: changes
+    if: >-
+      (needs.changes.outputs.docs == 'true')
+      || (github.event_name == 'workflow_dispatch')
+      || (github.event_name == 'release' && github.event.action == 'published')
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Install extra packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz
+
+      - name: Run tox
+        run: uv run --only-group=tox tox run -e docs
+
+      # Upload docs:
+      # - on pushes to main if *any* documentation content might have changed
+      # - on workflow dispatches
+      # - on pushes to tickets/ branches if docs/ directory content changed
+      - name: Upload to LSST the Docs
+        uses: lsst-sqre/ltd-upload@v1
+        with:
+          project: "pclient"
+          dir: "docs/_build/html"
+          username: ${{ secrets.LTD_USERNAME }}
+          password: ${{ secrets.LTD_PASSWORD }}
+        if: >-
+          (github.event_name == 'push' && github.ref_name == 'main')
+          || (github.event_name == 'merge_group')
+          || (github.event_name == 'workflow_dispatch')
+          || (github.event_name == 'pull_request'
+              && (startsWith(github.head_ref, 'tickets/')
+                  || startsWith(github.head_ref, 't/'))
+              && steps.filter.outputs.docs-specific == 'true')
+
+  linkcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    needs: changes
+    if: ${{ needs.changes.outputs.docs == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Install extra packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz
+
+      - name: Run tox
+        run: uv run --only-group=tox tox run -e docs-linkcheck
+
+  build:
+    needs: [test]
+    secrets: inherit
+    uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v3
+    with:
+      images: ghcr.io/${{ github.repository }}
+
+    # Only do Docker builds of tagged releases and pull requests from ticket
+    # branches. This will still trigger on pull requests from untrusted
+    # repositories whose branch names match our tickets/* branch convention,
+    # but in this case the build will fail with an error since the secret
+    # won't be set.
+    if: >
+      (github.event_name == 'release' && github.event.action == 'published')
+      || (github.event_name != 'merge_group'
+          && (startsWith(github.head_ref, 'tickets/')
+              || startsWith(github.head_ref, 't/')))
