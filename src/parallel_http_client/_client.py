@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """Client for parallel fetches.
 
-We assume that everything needed is in this file, the standard
-library, or httpx, and that this file is executable (which makes the
-subprocess stuff a lot easier to deal with).
-
 If parallelizing over subprocesses, each subprocess gets a contiguous region
 of the target URL.  Each such region is chunked for download and divided among
 worker threads using byte-range GET requests.
 """
 
-import argparse
 import asyncio
 import collections
 import datetime
 import logging
 import os
+import sys
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -36,6 +32,14 @@ class _TimingEvent:
     pid: int
     duration: datetime.timedelta | None = None
 
+    @override
+    def __str__(self) -> str:
+        retval = f"[{self.pid}] {self.time!s}"
+        if self.duration:
+            retval += f" (duration {self.duration})"
+        retval += f" {self.name}"
+        return retval
+
 
 @dataclass
 class _ByteRange:
@@ -50,11 +54,11 @@ class _ByteRange:
 
     @classmethod
     def from_str(cls, inp: str) -> Self:
-        first, last = map(int, inp.split("-"))
-        return cls(first=first, last=last)
+        first_s, last_s = inp.split("-")
+        return cls(first=int(first_s), last=int(last_s))
 
 
-class ParallelClient:
+class ParallelHTTPClient:
     """Download a URL using HTTP GET, using the Range header to pull the file
     in chunks, which the client then reassembles.
     """
@@ -113,7 +117,7 @@ class ParallelClient:
 
         # Set all the things we need to protect with a lock
         self._lock.acquire()
-        self._timings: list[_TimingEvent] = []
+        self._timings: dict[str, _TimingEvent] = {}
         self._ordinal = 1
         self._chunks: collections.deque[_ByteRange] = collections.deque()
         self._worker_threads = 0
@@ -122,10 +126,10 @@ class ParallelClient:
         # Set up logging
         self._logger = logging.getLogger("ParallelClient")
         loglevel = logging.DEBUG if self._debug else logging.INFO
-        logging.basicConfig(level=loglevel)
+        logging.basicConfig()
         self._logger.setLevel(loglevel)
 
-        self._me = Path(__file__).resolve()
+        self._me = Path(sys.argv[0]).resolve()
 
         self._logger.debug(
             f"[{self._pid}]"
@@ -173,7 +177,7 @@ class ParallelClient:
                 f.truncate()
             self._lock.acquire()
             self._ordinal = 1  # Reset event counter
-            self._timings = []  # and timings
+            self._timings = {}  # and timings
             self._lock.release()
             event = f"fetch {url}"
             self._start_stamp(event)  # Set first timestamp
@@ -214,7 +218,7 @@ class ParallelClient:
             raise ValueError("Do not know filesize for parallel fetch")
         self._start_stamp(event)
         fullrange = _ByteRange(first=0, last=size - 1)
-        if self._max_procs > 1:
+        if self._max_procs > 1 and size > self._chunk_size:
             await self._divide_subprocs(fullrange)
         else:
             await self._fetch_singleproc_parts(fullrange)
@@ -324,29 +328,40 @@ class ParallelClient:
     def _stamp(self, event: str, *, start: bool) -> None:
         now = datetime.datetime.now(tz=datetime.UTC)
         self._lock.acquire()
-        self._timings.append(
-            _TimingEvent(
+        timing_id = f"[{self._pid}] {event}"
+        if timing_id in self._timings:
+            ev = self._timings[timing_id]
+            if ev.start:
+                self._logger.warning(
+                    f"{timing_id} start requested and already seen;"
+                    " overwriting"
+                )
+            else:
+                if ev.duration:
+                    self._logger.warning(
+                        f"{timing_id} stop requested and already seen;"
+                        " overwriting"
+                    )
+                ev.duration = now - ev.start
+        else:
+            self._timings[timing_id] = _TimingEvent(
                 start=start,
                 ordinal=self._ordinal,
                 name=event,
                 time=now,
                 pid=self._pid,
             )
-        )
-        self._ordinal += 1
+            self._ordinal += 1
         self._lock.release()
 
     async def _generate_report(self) -> None:
         """Return event timings."""
         retval: list[str] = []
         self._lock.acquire()
-        self._add_durations()
-        for ev in self._timings:
-            ev_id = f"{ev.pid}:{ev.ordinal}:{ev.name}"
-            r_str = f"{ev_id}: {ev.time!s}"
-            if ev.duration:
-                r_str += f" duration {ev.duration!s}"
-            r_str += "\n"
+        events = list(self._timings.values())
+        events.sort(key=lambda x: x.time)
+        for ev in events:
+            r_str = str(ev) + "\n"
             retval.append(r_str)
         self._lock.release()
         pid = os.getpid()
@@ -361,34 +376,18 @@ class ParallelClient:
         for line in logtxt.split("\n"):
             self._logger.info(line)
 
-    def _add_durations(self) -> None:
-        e_d: dict[str, _TimingEvent] = {}
-        for ev in self._timings:
-            if ev.duration is not None:
-                continue  # We already have a timing
-            ev_id = f"{ev.pid}:{ev.name}"
-            if ev.start:
-                e_d[ev_id] = ev
-                continue
-            if ev_id:
-                continue
-            # Add duration to both start and finish times
-            ev.duration = ev.time - e_d[ev_id].time
-            e_d[ev_id].duration = ev.time - e_d[ev_id].time
-            # And remove it from the dict of things we're waiting for
-            del e_d[ev_id]
-        if e_d:
-            self._logger.warning(
-                f"[{self._pid}] Found start but no finish"
-                f" for {list(e_d.keys())}"
-            )
-
     async def _divide_subprocs(self, byte_range: _ByteRange) -> None:
         size = byte_range.last - byte_range.first + 1
-        if self._max_procs < 2:
+        max_procs = self._max_procs
+        total_chunks = int(size / self._chunk_size)
+        if (size % self._chunk_size) != 0:
+            total_chunks += 1
+        max_procs = min(max_procs, total_chunks)
+        if max_procs < 2:
             self._logger.warning(
                 f"[{self._pid}] Cannot subdivide process any further."
             )
+            await self._fetch_singleproc_parts(byte_range)
             return
         chunks_per_process = int(size / (self._max_procs * self._chunk_size))
         leftover_chunks = int(
@@ -465,7 +464,7 @@ class ParallelClient:
         output = self._output
         base_file = Path(output.name)
         tasks: set[asyncio.Task] = set()
-        event = "fetch single process parts"
+        event = f"fetch single process parts for {byte_range!s}"
         self._start_stamp(event)
         await self._chunk_range(byte_range)
         while True:
@@ -605,8 +604,10 @@ class ParallelClient:
     ) -> None:
         """Copy a part file into the target file at a specific offset."""
         # Old-school!  Feels like I'm doing file I/O in C!
-        event = (f"copy file part {inp!s} ({read_size} bytes) to"
-                 f" {outp!s} at {offset})")
+        event = (
+            f"copy file part {inp!s} ({read_size} bytes) to"
+            f" {outp!s} at {offset})"
+        )
         self._start_stamp(event)
         with outp.open("ab") as outp_f:
             outp_f.seek(offset)
@@ -618,110 +619,3 @@ class ParallelClient:
             if bw != len(data):
                 raise ValueError(f"Bad write: {bw}/{len(data)} to {outp!s}")
         self._end_stamp(event)
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="pclient",
-        description=(
-            "Fetches URLs in parallel, using multiple threads and/or"
-            ' multiple processes and the "Range" header'
-        ),
-    )
-    parser.add_argument("url", help="URL to fetch")
-    parser.add_argument(
-        "-o",
-        "--output",
-        help=("Output file [default: URL filename in current directory]"),
-    )
-    parser.add_argument(
-        "-w",
-        "--working-dir",
-        help=(
-            "Working directory parent for file download and reassembly"
-            " [default: system temporary directory, usually $TMPDIR or /tmp]"
-        ),
-    )
-    parser.add_argument(
-        "-p",
-        "--processes",
-        type=int,
-        help=("Number of processes [default: 1]"),
-    )
-    parser.add_argument(
-        "-t",
-        "--threads",
-        type=int,
-        help=("Number of threads per process [default: 10]"),
-    )
-    parser.add_argument(
-        "-c",
-        "--chunksize",
-        type=int,
-        help=("Chunk size to read per HTTP request [default: 1048576]"),
-    )
-    parser.add_argument(
-        "-r",
-        "--report",
-        action="store_true",
-        help=("Write summary report when finished [default: False]"),
-    )
-    parser.add_argument(
-        "-d",
-        "--debug",
-        action="store_true",
-        help=("Enable debugging output [default: False]"),
-    )
-    parser.add_argument(
-        "--byte-range",
-        help=(
-            "Byte range for subprocess: do not use on CLI."
-            " This will be used when the client is spawning subprocesses."
-        ),
-    )
-    parser.add_argument(
-        "--filesize",
-        type=int,
-        help=(
-            "File size for subprocess: do not use on CLI."
-            " This will be used when the client is spawning subprocesses."
-        ),
-    )
-    return _xform_args(parser.parse_args())
-
-
-def _xform_args(args: argparse.Namespace) -> argparse.Namespace:
-    if isinstance(args.url, str):
-        args.url = httpx.URL(args.url)
-    if args.output is None:
-        args.output = Path(str(args.url)).name
-    else:
-        args.output = Path(args.output)
-    if args.working_dir is not None:
-        if isinstance(args.working_dir, str):
-            args.working_dir = Path(args.working_dir)
-    if args.byte_range is not None:
-        if isinstance(args.byte_range, str):
-            args.byte_range = _ByteRange.from_str(args.byte_range)
-    return args
-
-
-def main() -> None:
-    """Download from a URL."""
-    args = _parse_args()
-    _ = ParallelClient(
-        url=args.url,
-        output=args.output,
-        working_dir=args.working_dir,
-        max_threads=args.threads,
-        max_procs=args.processes,
-        chunk_size=args.chunksize,
-        report=args.report,
-        debug=args.debug,
-        byte_range=args.byte_range,
-        filesize=args.filesize,
-    )
-
-
-if __name__ == "__main__":
-    main()
