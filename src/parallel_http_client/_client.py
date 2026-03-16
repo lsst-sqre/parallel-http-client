@@ -173,8 +173,9 @@ class ParallelHTTPClient:
                     "_master_fetch can only be called from parent process"
                 )
             # Truncate output file
-            with output.open("wb") as f:
-                f.truncate()
+            if not self._discard_output:
+                with output.open("wb") as f:
+                    f.truncate()
             self._lock.acquire()
             self._ordinal = 1  # Reset event counter
             self._timings = {}  # and timings
