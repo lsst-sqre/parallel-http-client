@@ -38,6 +38,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
+    "rangehttpserver",
     "scriv[toml]",
 ]
 
