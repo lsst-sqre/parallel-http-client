@@ -49,6 +49,12 @@ def _parse_args() -> argparse.Namespace:
         help=("Chunk size to read per HTTP request [default: 1048576]"),
     )
     parser.add_argument(
+        "-b",
+        "--benchmark",
+        action="store_true",
+        help=("Report download speed when finished [default: False]"),
+    )
+    parser.add_argument(
         "-r",
         "--report",
         action="store_true",
@@ -82,7 +88,7 @@ def _xform_args(args: argparse.Namespace) -> argparse.Namespace:
     if isinstance(args.url, str):
         args.url = httpx.URL(args.url)
     if args.output is None:
-        args.output = Path(str(args.url)).name
+        args.output = Path.cwd().resolve() / Path(str(args.url)).name
     else:
         args.output = Path(args.output)
     if args.working_dir is not None:
@@ -104,6 +110,7 @@ def parallel_fetch() -> None:
         max_threads=args.threads,
         max_procs=args.processes,
         chunk_size=args.chunksize,
+        benchmark=args.benchmark,
         report=args.report,
         debug=args.debug,
         byte_range=args.byte_range,

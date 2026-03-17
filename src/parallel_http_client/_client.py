@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self, override
 
+import anyio
 import httpx
 
 
@@ -25,18 +26,18 @@ import httpx
 class _TimingEvent:
     """Timing metric."""
 
-    start: bool
     ordinal: int
     name: str
-    time: datetime.datetime
+    start: datetime.datetime
     pid: int
+    end: datetime.datetime | None = None
     duration: datetime.timedelta | None = None
 
     @override
     def __str__(self) -> str:
-        retval = f"[{self.pid}] {self.time!s}"
+        retval = f"[{self.pid}] {self.start!s}"
         if self.duration:
-            retval += f" (duration {self.duration})"
+            retval += f" (duration {self.duration.total_seconds()}s)"
         retval += f" {self.name}"
         return retval
 
@@ -57,6 +58,10 @@ class _ByteRange:
         first_s, last_s = inp.split("-")
         return cls(first=int(first_s), last=int(last_s))
 
+    @property
+    def size(self) -> int:
+        return (self.last - self.first) + 1
+
 
 class ParallelHTTPClient:
     """Download a URL using HTTP GET, using the Range header to pull the file
@@ -72,6 +77,7 @@ class ParallelHTTPClient:
         max_threads: int | None = None,
         max_procs: int | None = None,
         chunk_size: int | None = None,
+        benchmark: bool = False,
         report: bool = False,
         debug: bool = False,
         byte_range: _ByteRange | None = None,
@@ -85,11 +91,13 @@ class ParallelHTTPClient:
         does the division of the file into max_procs equally-sized ranges.
         """
         self._url = url
-        self.output: Path | None = None
+        self._output: Path = Path()
         if output is None:
-            self._output = Path(Path(self._url.path).name)
+            self._output = Path.cwd().resolve() / Path(self._url.path).name
         else:
             self._output = output
+        if not (self._output.is_absolute()):
+            self._output = Path.cwd().resolve() / self._output
         self._working_dir = working_dir
         self._byte_range = byte_range
         if max_procs is None:
@@ -104,6 +112,7 @@ class ParallelHTTPClient:
             self._max_procs = 1
         self._max_threads = max_threads
         self._chunk_size = chunk_size
+        self._benchmark = benchmark
         self._report = report
         self._debug = debug
         self._discard_output = False
@@ -166,6 +175,8 @@ class ParallelHTTPClient:
         work_dir = self._working_dir
         with tempfile.TemporaryDirectory(dir=work_dir) as wd:
             cwd = Path(wd)
+            if self._working_dir is None:
+                self._working_dir = cwd
             os.chdir(cwd)
             self._logger.debug(f"[{self._pid}] Working directory is now {wd}")
             if self._byte_range:
@@ -191,6 +202,18 @@ class ParallelHTTPClient:
             else:
                 await self._parallel_fetch()
             self._end_stamp(event)
+            if self._benchmark:
+                ev_id = f"[{self._pid}] {event}"
+                elapsed = self._timings[ev_id].duration
+                size = self._filesize or output.stat().st_size
+                if elapsed is None:
+                    self._logger.warning(
+                        f"Cannot calculate download rate for {self._url};"
+                        " duration unknown."
+                    )
+                else:
+                    rate = int(size / elapsed.total_seconds())
+                    self._logger.info(f"Download rate: {rate} bytes/sec")
             if not self._discard_output:
                 await self._reassemble_file_parts()
             if self._report:
@@ -304,81 +327,82 @@ class ParallelHTTPClient:
         verb = "write"
         if self._discard_output:
             verb = "discard"
-        event = f"{verb} file {output!s} from HTTP response"
+        event = f"{verb} file {output!s} from HTTP response "
         self._start_stamp(event)
         r.raise_for_status()
         if self._discard_output:
             self._end_stamp(event)
             return
-        with output.open("wb") as f:
+        async with await anyio.open_file(output, "wb") as f:
             async for data in r.aiter_bytes():
+                expected = len(data)
                 self._logger.debug(
-                    f"[{self._pid}] writing {len(data)} bytes to {output!s}"
+                    f"[{self._pid}] writing {expected} bytes to {output!s}"
                 )
-                f.write(data)
+                written = await f.write(data)
+                self._check_write(written, expected, output)
         self._end_stamp(event)
 
     def _start_stamp(self, event: str) -> None:
-        self._logger.debug(f"[{self._pid}] Start {event}")
-        self._stamp(event=event, start=True)
-
-    def _end_stamp(self, event: str) -> None:
-        self._stamp(event=event, start=False)
-        self._logger.debug(f"[{self._pid}] Stop {event}")
-
-    def _stamp(self, event: str, *, start: bool) -> None:
+        event_id = f"[{self._pid}] {event}"
+        self._logger.debug(f"{event_id} start")
         now = datetime.datetime.now(tz=datetime.UTC)
         self._lock.acquire()
-        timing_id = f"[{self._pid}] {event}"
-        if timing_id in self._timings:
-            ev = self._timings[timing_id]
-            if ev.start:
-                self._logger.warning(
-                    f"{timing_id} start requested and already seen;"
-                    " overwriting"
-                )
-            else:
-                if ev.duration:
-                    self._logger.warning(
-                        f"{timing_id} stop requested and already seen;"
-                        " overwriting"
-                    )
-                ev.duration = now - ev.start
-        else:
-            self._timings[timing_id] = _TimingEvent(
-                start=start,
-                ordinal=self._ordinal,
-                name=event,
-                time=now,
-                pid=self._pid,
+        if event_id in self._timings:
+            self._logger.warning(
+                f"{event_id} start requested and already seen; overwriting."
             )
-            self._ordinal += 1
+        self._timings[event_id] = _TimingEvent(
+            ordinal=self._ordinal,
+            name=event,
+            start=now,
+            end=None,
+            pid=self._pid,
+            duration=None,
+        )
+        self._ordinal += 1
         self._lock.release()
+
+    def _end_stamp(self, event: str) -> None:
+        event_id = f"[{self._pid}] {event}"
+        if event_id not in self._timings:
+            self._logger.warning(
+                f"{event_id} end requested but start not seen."
+            )
+            return
+        ev = self._timings[event_id]
+        now = datetime.datetime.now(tz=datetime.UTC)
+        ev.end = now
+        ev.duration = now - ev.start
+        self._logger.debug(f"{event_id} end")
 
     async def _generate_report(self) -> None:
         """Return event timings."""
         retval: list[str] = []
         self._lock.acquire()
         events = list(self._timings.values())
-        events.sort(key=lambda x: x.time)
+        events.sort(key=lambda x: x.start)
         for ev in events:
             r_str = str(ev) + "\n"
             retval.append(r_str)
         self._lock.release()
         pid = os.getpid()
         logfile = Path(f"client.{pid}.log")
-        logfile.write_text(r_str)
+        async with await anyio.open_file(logfile, "w") as f:
+            written = await f.write(r_str)
+            self._check_write(written, len(r_str), logfile)
 
     async def _consolidate_reports(self) -> None:
         logtxt = ""
         logfiles = Path().glob("client.*.log")
         for lg in logfiles:
-            logtxt += lg.read_text()
-        for line in logtxt.split("\n"):
-            self._logger.info(line)
+            async with await anyio.open_file(lg) as f:
+                async for line in f:
+                    logtxt += line
+        self._logger.info(f"Performance report:\n{logtxt}")
 
     async def _divide_subprocs(self, byte_range: _ByteRange) -> None:
-        size = byte_range.last - byte_range.first + 1
+        size = byte_range.size
         max_procs = self._max_procs
         total_chunks = int(size / self._chunk_size)
         if (size % self._chunk_size) != 0:
@@ -386,13 +410,14 @@ class ParallelHTTPClient:
         max_procs = min(max_procs, total_chunks)
         if max_procs < 2:
             self._logger.warning(
-                f"[{self._pid}] Cannot subdivide process any further."
+                f"[{self._pid}] Cannot subdivide process any further;"
+                f" falling back to single-process fetch."
             )
             await self._fetch_singleproc_parts(byte_range)
             return
         chunks_per_process = int(size / (self._max_procs * self._chunk_size))
         leftover_chunks = int(
-            (size - self._max_procs * chunks_per_process * self._chunk_size)
+            (size - max_procs * chunks_per_process * self._chunk_size)
             / self._chunk_size
         )
         leftover_bytes = size - (
@@ -402,7 +427,7 @@ class ParallelHTTPClient:
             leftover_chunks += 1
         proc_ranges: list[_ByteRange] = []
         offset = 0
-        for i in range(self._max_procs):
+        for i in range(max_procs):
             first = offset
             last = offset + self._chunk_size * chunks_per_process - 1
             if i + leftover_chunks >= self._max_procs:
@@ -411,6 +436,7 @@ class ParallelHTTPClient:
                 last = size - 1
             proc_ranges.append(_ByteRange(first=first, last=last))
             offset = last + 1
+        self._logger.debug(f"process ranges: {proc_ranges}")
         await self._spawn_subprocs(proc_ranges, size)
 
     async def _spawn_subprocs(
@@ -465,7 +491,9 @@ class ParallelHTTPClient:
         output = self._output
         base_file = Path(output.name)
         tasks: set[asyncio.Task] = set()
-        event = f"fetch single process parts for {byte_range!s}"
+        event = (
+            f"fetch single process parts for {byte_range!s} of {output.name}"
+        )
         self._start_stamp(event)
         await self._chunk_range(byte_range)
         while True:
@@ -555,7 +583,7 @@ class ParallelHTTPClient:
         r_text = f"bytes={byte_range!s}"
         part_file = Path(f"{base_file.name}.{s_text}-{l_text}.part")
         hdr = {"Range": r_text}
-        event = f"GET {url!s} range {r_text}"
+        event = f"GET {url!s} range {r_text} to {part_file!s}"
         self._start_stamp(event)
         async with httpx.AsyncClient(http2=True, follow_redirects=True) as c:
             async with c.stream("GET", url, headers=hdr) as r:
@@ -569,54 +597,31 @@ class ParallelHTTPClient:
             return
         outp = self._output
         base_name = outp.name
-        event = f"Reassemble {base_name}"
+        event = f"Assemble {outp!s}"
         self._start_stamp(event)
-        parts = Path().glob(f"{base_name}.*.part")
+        parts = sorted(Path().glob(f"{base_name}.*.part"))
         self._logger.debug(f"[{self._pid}] file parts: {parts}")
-        async with asyncio.TaskGroup() as tg:
-            tasks: set[asyncio.Task] = set()
-            for partfile in parts:
-                tasks.add(
-                    tg.create_task(
-                        self._write_file_chunk_to_target(partfile, outp)
+        async with await anyio.open_file(outp, "wb") as outf:
+            for part in parts:
+                async with await anyio.open_file(part, "rb") as inf:
+                    ev2 = f"copy data from {part!s} to {outp!s}"
+                    self._start_stamp(ev2)
+                    data = await inf.read()
+                    written = await outf.write(data)
+                    self._logger.debug(
+                        f"Copied {written}/{len(data)} bytes from {part!s}"
+                        f" to {outp!s}"
                     )
-                )
+                    self._end_stamp(ev2)
+                    self._check_write(written, len(data), outp)
         self._end_stamp(event)
 
-    async def _write_file_chunk_to_target(self, inp: Path, outp: Path) -> None:
-        event = f"write chunk file {inp!s} to target {outp!s}"
-        self._start_stamp(event)
-        fname = inp.name
-        parts = inp.name.split(".")
-        if len(parts) < 3 or parts[-1] != "part":
-            raise ValueError(f"{fname} doesn't look like a part file")
-        first, last = map(int, parts[-2].split("-"))
-        size = last - first + 1
-        if size > self._chunk_size:
-            self._logger.warning(
-                f"[{self._pid}] Chunk size {size} > {self._chunk_size}"
-            )
-            size = self._chunk_size
-        self._copy_file_part(inp, outp, size, offset=first)
-        self._end_stamp(event)
-
-    def _copy_file_part(
-        self, inp: Path, outp: Path, read_size: int, offset: int
-    ) -> None:
-        """Copy a part file into the target file at a specific offset."""
-        # Old-school!  Feels like I'm doing file I/O in C!
-        event = (
-            f"copy file part {inp!s} ({read_size} bytes) to"
-            f" {outp!s} at {offset})"
+    def _check_write(self, written: int, expected: int, path: Path) -> None:
+        if written == expected:
+            return
+        errstr = (
+            f"Bad write: wrote {written} bytes to {path}"
+            f" but expected {expected}"
         )
-        self._start_stamp(event)
-        with outp.open("ab") as outp_f:
-            outp_f.seek(offset)
-            data = inp.read_bytes()
-            self._logger.debug(
-                f"[{self._pid}] Read {len(data)} bytes from {inp!s}"
-            )
-            bw = outp_f.write(data)
-            if bw != len(data):
-                raise ValueError(f"Bad write: {bw}/{len(data)} to {outp!s}")
-        self._end_stamp(event)
+        self._logger.error(errstr)
+        raise ValueError(errstr)
