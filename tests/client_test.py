@@ -44,10 +44,6 @@ def test_multithreaded(range_server: None, fake_fs: FakeFilesystem) -> None:
     assert reference.read_text() == output.read_text()
 
 
-# The multiprocess stuff doesn't work well with fake_fs.
-# Seems to be fine in the field.
-
-
 @pytest.mark.usefixtures("range_server", "fake_fs")
 def test_big_chunk_singleprocess(
     range_server: None, fake_fs: FakeFilesystem
@@ -64,3 +60,7 @@ def test_big_chunk_singleprocess(
         debug=True,
     )
     assert reference.read_text() == output.read_text()
+
+
+# The multiprocess stuff doesn't work well with fake_fs.
+# Seems to be fine in the field.

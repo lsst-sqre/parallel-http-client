@@ -585,9 +585,21 @@ class ParallelHTTPClient:
         hdr = {"Range": r_text}
         event = f"GET {url!s} range {r_text} to {part_file!s}"
         self._start_stamp(event)
-        async with httpx.AsyncClient(http2=True, follow_redirects=True) as c:
-            async with c.stream("GET", url, headers=hdr) as r:
-                await self._write_file(part_file, r)
+        timeout = httpx.Timeout(5.0, connect=10.0)
+        try:
+            async with httpx.AsyncClient(
+                http2=True, follow_redirects=True, timeout=timeout
+            ) as c:
+                async with c.stream("GET", url, headers=hdr) as r:
+                    await self._write_file(part_file, r)
+        except Exception:
+            self._logger.warning(
+                f"HTTP GET {url} range {byte_range!s} failed; returning"
+                " chunk to queue"
+            )
+            self._lock.acquire()
+            self._chunks.append(byte_range)
+            self._lock.release()
         self._end_stamp(event)
 
     async def _reassemble_file_parts(
